@@ -5,7 +5,7 @@ import math
 import random 
 import datetime
 from overcooked_ai_py.mdp.actions import Action, Direction, LLMActionSet
-from llm_coordination_agents.overcooked_agent import LLMAgent, ReflexionAgent
+from llm_coordination_agents.overcooked_agent import ScriptedAgent
 import re
 
 def set_global_seed(seed):
@@ -70,8 +70,8 @@ storage_counter_locations = {
 }
 
 
-class LLMActionManager(object):
-    def __init__(self, mdp, player_name, layout_name, model_name, reflector=False): 
+class ScriptedActionManager(object):
+    def __init__(self, mdp, player_name, layout_name, script_name): 
         self.layout_name = layout_name
         self.mdp = mdp 
         self.time_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -110,10 +110,12 @@ class LLMActionManager(object):
         self.player_name = player_name 
         self.player_id = int(self.player_name[-1])
         self.other_player_id = 1 if self.player_id == 0 else 0 
-        self.should_get_stage_from_llm = True 
+        self.should_get_stage_from_script = True 
         self.current_stage = None 
         self.moving_away = False 
-        self.state_for_llm = {
+
+        # TODO:: GET RID OF THIS MAYBE, ALIGN CLASS VARIABLES
+        self.state_for_script = {
             self.player_id: {'held_object': 'nothing'},
             self.other_player_id: {'held_object': 'nothing'},
             'distances': {
@@ -134,12 +136,10 @@ class LLMActionManager(object):
             'gate_open_time': [0, 0],
             'soup_in_cooker_remaining_time': [0, 0]
         }
+
         self.action_set = LLMActionSet[self.layout_name]
         self.message = ''
-        if reflector:
-            self.llm_agent = ReflexionAgent(self.player_id, self.layout_name, model_name, reflector)
-        else:
-            self.llm_agent = LLMAgent(self.player_id, self.layout_name, model_name, reflector) 
+        self.script_agent = ScriptedAgent(self.player_id, self.layout_name, script_name) 
         self.save_low_level_trajectory = True
         self.prev_directive = 'wait.'
 
@@ -156,21 +156,21 @@ class LLMActionManager(object):
 
         # If player sends a message, current stage may be changed midway. 
         if other_player_message!= '':
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
 
-        # if previous stage is complete, get new stage from llm 
-        if self.should_get_stage_from_llm:
-            self.get_stage_from_llm(state, other_player_message)         
+        # if previous stage is complete, get new stage from script
+        if self.should_get_stage_from_script:
+            self.get_stage_from_script(state, other_player_message)         
         
         print(self.current_stage)
 
         if 'wait' in self.current_stage.lower():
             self.selected_action = Action.STAY 
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
         
         elif 'away' in self.current_stage.lower():
             self.selected_action = self.move_away_deterministic()
-            self.should_get_stage_from_llm = True
+            self.should_get_stage_from_script = True
 
         else:
             location, location_id = extract_location(self.current_stage)
@@ -214,11 +214,11 @@ class LLMActionManager(object):
         # Handle case where loc_agent_a = goal_agent_b and loc_agent_b = goal_agent_a  AND  gate closed 
         # if self.selected_action == Action.STAY and self.current_stage not in ['wait.', 'load soup on plate from c0.', 'load soup on plate from c1.']:
             # print(f"Case 1 stalemate for player {self.player_id}. info - {self.selected_action}, {self.current_stage}")
-            # self.should_get_stage_from_llm = True 
+            # self.should_get_stage_from_script = True 
         
         # Handle case goal_agent_a = goal_agent_b
         if 'wait' not in self.prev_directive and self.prev_selection_action != Action.INTERACT and self.selected_action != Action.INTERACT and 'wait' not in self.current_stage:
-            if self.player_position == self.prev_position and self.prev_orienation == self.player_orientation and self.should_get_stage_from_llm == False:
+            if self.player_position == self.prev_position and self.prev_orienation == self.player_orientation and self.should_get_stage_from_script == False:
                 if int(self.player_id) == 1:
                     # print(f"Case 2 stalemate. info prev_directive - {self.prev_directive} prev_selected_action - {self.prev_selection_action} - current_stage - {self.current_stage}")
                     if self.prev_position == self.player_position and self.prev_directive == 'move away deterministic':
@@ -288,26 +288,27 @@ class LLMActionManager(object):
             new_pos = (self.player_position[0] + direction[0], self.player_position[1] + direction[1])
             # # print(f"INFO: starting position {self.player_position}, moving away to new position {new_pos}, moving in direction {direction}")
             if self.mdp.get_terrain_type_at_pos(new_pos) == " ":
-                self.should_get_stage_from_llm = True
+                self.should_get_stage_from_script = True
                 return self.go_to_position(new_pos)
 
         # If no accessible direction is found, wait in place
-        self.should_get_stage_from_llm = True
+        self.should_get_stage_from_script = True
         # # print(f"ERROR: No position found to move away to")
         return Action.STAY
     
+    # TODO::
     def move_to(self, location, location_id=0):
         # target_locs_arr, pseudo_obj_loc_arr = self.get_nearest_unblocked_object_locations(self.player_position[0], self.player_position[1], obj=location)
         location_coords = self.object_location[location][location_id]
         target_locs_arr = self.get_adjacent_empty_points(location_coords)
         if target_locs_arr == None:
             # Another stalemate handler 
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
             return Action.STAY
         
         # TODO: Make a decision about this 
         elif len(target_locs_arr) == 0:
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
             return Action.STAY
         if self.player_position in target_locs_arr:
             idx = target_locs_arr.index(self.player_position)
@@ -324,7 +325,7 @@ class LLMActionManager(object):
         state_dict = state.to_dict()
         # Add assertions to check whether player is actually next to item and facing it 
         if state_dict['players'][int(self.player_id)]['held_object'] == None:
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
             return Action.INTERACT
         else:
             # # print(f"ERROR: Already holding object, cannot pick up {item}")
@@ -336,9 +337,9 @@ class LLMActionManager(object):
             pot_states_dict = self.mdp.get_pot_states(state)
             if 'ready' in pot_states_dict['onion']:
                 if self.object_location['c'][location_id] in pot_states_dict['onion']['ready']:
-                    self.should_get_stage_from_llm = True 
+                    self.should_get_stage_from_script = True 
                     return Action.INTERACT
-        self.should_get_stage_from_llm = True 
+        self.should_get_stage_from_script = True 
         return Action.STAY
 
 
@@ -346,7 +347,7 @@ class LLMActionManager(object):
         state_dict = state.to_dict()
         # Add assertions to check whether player is actually next to location and facing it 
         if state_dict['players'][int(self.player_id)]['held_object'] != None:
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
             return Action.INTERACT
         else:
             # # print(f"ERROR: Not holding {item} cannot complete")
@@ -355,18 +356,18 @@ class LLMActionManager(object):
     def open(self, state):
         state_dict = state.to_dict()
         if state_dict['players'][int(self.player_id)]['held_object'] == None:
-            self.should_get_stage_from_llm = True 
+            self.should_get_stage_from_script = True 
             return Action.INTERACT
         
 
     def _populate_distances(self):
-        for k, v in self.state_for_llm['distances'].items():
-            for i in range(len(self.state_for_llm['distances'][k])):
+        for k, v in self.state_for_script['distances'].items():
+            for i in range(len(self.state_for_script['distances'][k])):
 
                 # Find all distances for me 
                 adjc_accessible_points = self.get_adjacent_accessible_points(self.object_location[k[0]][i])
                 if len(adjc_accessible_points) <= 0:
-                    self.state_for_llm['distances'][k][i][0] = 'infinite'
+                    self.state_for_script['distances'][k][i][0] = 'infinite'
                 else:
 
                     # dest = self._find_closest_point(self.player_position, self.other_player_position, adjc_accessible_points)
@@ -379,14 +380,14 @@ class LLMActionManager(object):
                     #     dist = 'infinite'
                     # elif dest == self.other_player_position:
                     #     dist = 'blocked'
-                    self.state_for_llm['distances'][k][i][0] = str(dist)
+                    self.state_for_script['distances'][k][i][0] = str(dist)
 
                     adjc_accessible_points, dest, dist = None, None, None 
 
                 # Find all distances for my partner 
                 adjc_accessible_points = self.get_adjacent_accessible_points(self.object_location[k[0]][i])
                 if len(adjc_accessible_points) <= 0:
-                    self.state_for_llm['distances'][k][i][0] = 'infinite'
+                    self.state_for_script['distances'][k][i][0] = 'infinite'
                 else:
                     # dest = self._find_closest_point(self.other_player_position, self.player_position, adjc_accessible_points)
                     # dist = self.find_shortest_distance(self.other_player_position, dest, self.player_position)
@@ -395,7 +396,7 @@ class LLMActionManager(object):
                     #     dist = 'infinite'
                     # elif dest == self.player_position:
                     #     dist = 'blocked'
-                    self.state_for_llm['distances'][k][i][1] = str(dist)
+                    self.state_for_script['distances'][k][i][1] = str(dist)
 
 
 
@@ -445,29 +446,29 @@ class LLMActionManager(object):
         for idx, pot_pos in enumerate(self.object_location['c']):
             if not state.has_object(pot_pos):
                 # # print(f"{bcolors.OKGREEN}SOUP IS NOT COOKING in c{idx} and there are 0 onions{bcolors.ENDC}")
-                self.state_for_llm['num_onions_in_pot'][idx] = 0 
-                self.state_for_llm['soup_in_cooker_status'][idx] = 'not cooking'
-                self.state_for_llm['cooker_status'][idx] = 'off'
+                self.state_for_script['num_onions_in_pot'][idx] = 0 
+                self.state_for_script['soup_in_cooker_status'][idx] = 'not cooking'
+                self.state_for_script['cooker_status'][idx] = 'off'
             else:
                 soup = state.get_object(pot_pos)
                 if self.is_ready(soup):
                     # # print(f"{bcolors.OKGREEN}SOUP IS READY in c{idx} {bcolors.ENDC}")
-                    self.state_for_llm['soup_in_cooker_status'][idx] = 'cooked'
-                    self.state_for_llm['cooker_status'][idx] = 'off'
-                    self.state_for_llm['num_onions_in_pot'][idx] = 3
+                    self.state_for_script['soup_in_cooker_status'][idx] = 'cooked'
+                    self.state_for_script['cooker_status'][idx] = 'off'
+                    self.state_for_script['num_onions_in_pot'][idx] = 3
                 elif self.is_cooking(soup):
                     # # print(f"{bcolors.OKGREEN}SOUP IS COOKING in c{idx} {bcolors.ENDC}")
-                    self.state_for_llm['soup_in_cooker_status'][idx] = 'still cooking'
-                    self.state_for_llm['cooker_status'][idx] = 'on'
-                    self.state_for_llm['num_onions_in_pot'][idx] = 3
+                    self.state_for_script['soup_in_cooker_status'][idx] = 'still cooking'
+                    self.state_for_script['cooker_status'][idx] = 'on'
+                    self.state_for_script['num_onions_in_pot'][idx] = 3
                     _, _, cook_time = soup.state 
-                    self.state_for_llm['soup_in_cooker_remaining_time'][idx] = cook_time
+                    self.state_for_script['soup_in_cooker_remaining_time'][idx] = cook_time
                 else:
-                    # # print(f"{bcolors.OKGREEN}SOUP IS NOT COOKING in c{idx} and there are {self.state_for_llm['num_onions_in_pot'][idx]} onions {bcolors.ENDC}")
+                    # # print(f"{bcolors.OKGREEN}SOUP IS NOT COOKING in c{idx} and there are {self.state_for_script['num_onions_in_pot'][idx]} onions {bcolors.ENDC}")
                     _, num_ingredients, _ = soup.state 
-                    self.state_for_llm['soup_in_cooker_status'][idx] = 'not cooking'
-                    self.state_for_llm['cooker_status'][idx] = 'off'
-                    self.state_for_llm['num_onions_in_pot'][idx] = num_ingredients
+                    self.state_for_script['soup_in_cooker_status'][idx] = 'not cooking'
+                    self.state_for_script['cooker_status'][idx] = 'off'
+                    self.state_for_script['num_onions_in_pot'][idx] = num_ingredients
 
     def _populate_counter_objects(self, state, counter_type='kitchen'):
         counter_objects = {}
@@ -483,13 +484,14 @@ class LLMActionManager(object):
                 counter_objects[pos] = 'soup in plate'
         for idx, pos in enumerate(self.object_location[f'{counter_type[0]}']):
             if pos in counter_objects:
-                self.state_for_llm[f'{counter_type}_counter_objects'][idx] = counter_objects[pos]
+                self.state_for_script[f'{counter_type}_counter_objects'][idx] = counter_objects[pos]
             else:
-                self.state_for_llm[f'{counter_type}_counter_objects'][idx] = 'empty'
+                self.state_for_script[f'{counter_type}_counter_objects'][idx] = 'empty'
     
     
 
-    def get_stage_from_llm(self, state, other_player_message):
+    # TODO ::
+    def get_stage_from_script(self, state, other_player_message):
         state_dict = state.to_dict()
 
         # Deal with objects on the counter
@@ -499,27 +501,29 @@ class LLMActionManager(object):
         
         self._populate_counter_objects(state, counter_type='kitchen')
 
-        # # print(f"{bcolors.FAIL}{self.state_for_llm['counter_objects']}{bcolors.ENDC}")
+        # # print(f"{bcolors.FAIL}{self.state_for_script['counter_objects']}{bcolors.ENDC}")
+        
         # What are the 2 players holding? 
+        # THIS player
         if state_dict['players'][int(self.player_id)]['held_object'] != None:
             if state_dict['players'][int(self.player_id)]['held_object']['name']  == 'dish':
-                self.state_for_llm[self.player_id]['held_object'] = 'plate'
+                self.state_for_script[self.player_id]['held_object'] = 'plate'
             elif state_dict['players'][int(self.player_id)]['held_object']['name'] == 'soup':
-               self.state_for_llm[self.player_id]['held_object'] = 'soup in plate' 
+               self.state_for_script[self.player_id]['held_object'] = 'soup in plate' 
             else:
-                self.state_for_llm[self.player_id]['held_object'] = state_dict['players'][int(self.player_id)]['held_object']['name']
+                self.state_for_script[self.player_id]['held_object'] = state_dict['players'][int(self.player_id)]['held_object']['name']
         else:
-            self.state_for_llm[self.player_id]['held_object'] = 'nothing'
-        
+            self.state_for_script[self.player_id]['held_object'] = 'nothing'
+        # OTHER player
         if state_dict['players'][int(self.other_player_id)]['held_object'] != None:
             if state_dict['players'][int(self.other_player_id)]['held_object']['name']  == 'dish':
-                self.state_for_llm[self.other_player_id]['held_object'] = 'plate'
+                self.state_for_script[self.other_player_id]['held_object'] = 'plate'
             elif state_dict['players'][int(self.other_player_id)]['held_object']['name'] == 'soup':
-               self.state_for_llm[self.other_player_id]['held_object'] = 'soup in plate' 
+               self.state_for_script[self.other_player_id]['held_object'] = 'soup in plate' 
             else:
-                self.state_for_llm[self.other_player_id]['held_object'] = state_dict['players'][int(self.other_player_id)]['held_object']['name']
+                self.state_for_script[self.other_player_id]['held_object'] = state_dict['players'][int(self.other_player_id)]['held_object']['name']
         else:
-            self.state_for_llm[self.other_player_id]['held_object'] = 'nothing'
+            self.state_for_script[self.other_player_id]['held_object'] = 'nothing'
         
 
 
@@ -531,18 +535,18 @@ class LLMActionManager(object):
         for idx, gate in enumerate(self.object_location['g']):
             x, y = gate
             if self.mdp.terrain_mtx[y][x] == ' ':
-                self.state_for_llm['gate_status'][idx] = 'open'
-                self.state_for_llm['gate_open_time'][idx] = self.mdp.gate_states[gate][-1]
+                self.state_for_script['gate_status'][idx] = 'open'
+                self.state_for_script['gate_open_time'][idx] = self.mdp.gate_states[gate][-1]
             else:
-                self.state_for_llm['gate_status'][idx] = 'closed'
-                self.state_for_llm['gate_open_time'][idx] = 0
+                self.state_for_script['gate_status'][idx] = 'closed'
+                self.state_for_script['gate_open_time'][idx] = 0
         prev_stage = self.current_stage
-        # if self.current_stage == 'put onion in c0.' and self.state_for_llm['num_onions_in_pot'][0] == 3:
+        # if self.current_stage == 'put onion in c0.' and self.state_for_script['num_onions_in_pot'][0] == 3:
         #     self.current_stage = 'turn on c0.'
-        # elif self.current_stage == 'put onion in c1.' and self.state_for_llm['num_onions_in_pot'][1] == 3:
+        # elif self.current_stage == 'put onion in c1.' and self.state_for_script['num_onions_in_pot'][1] == 3:
         #     self.current_stage = 'turn on c1.'
         # else:
-        self.current_stage, self.message = self.llm_agent.get_player_action(self.state_for_llm, other_player_message)
+        self.current_stage, self.message = self.script_agent.get_player_action(self.state_for_script, other_player_message)
         
         # if self.current_stage == 'move away from cooker.':
         #     if prev_stage.startswith('put onion in pot.'):
@@ -550,14 +554,14 @@ class LLMActionManager(object):
         #     else:
         #         self.current_stage = prev_stage
         # if self.current_stage == 'wait.':
-        #     # # print("Inside wait: ", self.state_for_llm)
-        #     if self.state_for_llm[self.player_id]['held_object'] == 'onion' and (self.state_for_llm['cooker_status'][0] == 'on' or self.state_for_llm['soup_in_cooker_status'][0] == 'cooked'):
+        #     # # print("Inside wait: ", self.state_for_script)
+        #     if self.state_for_script[self.player_id]['held_object'] == 'onion' and (self.state_for_script['cooker_status'][0] == 'on' or self.state_for_script['soup_in_cooker_status'][0] == 'cooked'):
         #         # # print("MOVING AWAY FOR PLAYER ", self.player_id)
         #         self.current_stage = 'move away.'
         
-        self.should_get_stage_from_llm = False 
+        self.should_get_stage_from_script = False 
     
-    def generate_state_for_llm(self, state):
+    def generate_state_for_script(self, state):
         state_dict = state.to_dict()
 
         # Deal with objects on the counter
@@ -567,30 +571,31 @@ class LLMActionManager(object):
         
         self._populate_counter_objects(state, counter_type='kitchen')
 
-        # # print(f"{bcolors.FAIL}{self.state_for_llm['counter_objects']}{bcolors.ENDC}")
+        # # print(f"{bcolors.FAIL}{self.state_for_script['counter_objects']}{bcolors.ENDC}")
+
         # What are the 2 players holding? 
         if state_dict['players'][int(self.player_id)]['held_object'] != None:
             if state_dict['players'][int(self.player_id)]['held_object']['name']  == 'dish':
-                self.state_for_llm[self.player_id]['held_object'] = 'plate'
+                self.state_for_script[self.player_id]['held_object'] = 'plate'
             else:
-                self.state_for_llm[self.player_id]['held_object'] = state_dict['players'][int(self.player_id)]['held_object']['name']
+                self.state_for_script[self.player_id]['held_object'] = state_dict['players'][int(self.player_id)]['held_object']['name']
         else:
-            self.state_for_llm[self.player_id]['held_object'] = 'nothing'
+            self.state_for_script[self.player_id]['held_object'] = 'nothing'
         
         if state_dict['players'][int(self.other_player_id)]['held_object'] != None:
             if state_dict['players'][int(self.other_player_id)]['held_object']['name']  == 'dish':
-                self.state_for_llm[self.other_player_id]['held_object'] = 'plate'
+                self.state_for_script[self.other_player_id]['held_object'] = 'plate'
             else:
-                self.state_for_llm[self.other_player_id]['held_object'] = state_dict['players'][int(self.other_player_id)]['held_object']['name']
+                self.state_for_script[self.other_player_id]['held_object'] = state_dict['players'][int(self.other_player_id)]['held_object']['name']
         else:
-            self.state_for_llm[self.other_player_id]['held_object'] = 'nothing'
+            self.state_for_script[self.other_player_id]['held_object'] = 'nothing'
         
         # pots, num onions in each pot and status of each pot 
 
         self._populate_distances()
         self._populate_pot_states(state)
 
-        return self.state_for_llm
+        return self.state_for_script
     
     def process_message(self, state, other_player_message):
         if other_player_message == '':
@@ -842,7 +847,7 @@ class LLMActionManager(object):
                 
                 # TODO: Make a decision about this 
                 # elif str(self.mdp.get_terrain_type_at_pos(new_pos)) in ["1", "2"]:
-                #     self.should_get_stage_from_llm = True 
+                #     self.should_get_stage_from_script = True 
 
         return None
 

@@ -17,12 +17,16 @@ logging.debug('Initiated Logger...')
 import time 
 import os.path
 from fuzzywuzzy import process
+import pdb
 
 def set_global_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
 
 set_global_seed(42)
+AZURE_OPENAI_API_BASE='REMOVED'
+AZURE_OPENAI_API_KEY='REMOVED'
+
 
 # When using openai API
 # openai.api_key = os.environ['API_KEY']
@@ -127,7 +131,36 @@ class LLMManager:
         total_tokens = completion.usage.total_tokens
         return completion.choices[0].message.content
 
-
+class LMMEngineAzureOpenAI():
+    def __init__(self, api_key=None, azure_endpoint=None, model=None, api_version=None, rate_limit=-1, **kwargs):
+        assert model is not None, "model must be provided"
+        self.model = model
+        assert api_version is not None, "api_version must be provided"
+        self.api_version = api_version
+        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
+        if api_key is None:
+            raise ValueError("An API Key needs to be provided in either the api_key parameter or as an environment variable named AZURE_OPENAI_API_KEY")
+        self.api_key = api_key
+        azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_API_BASE")
+        if azure_endpoint is None:
+            raise ValueError("An Azure API endpoint needs to be provided in either the azure_endpoint parameter or as an environment variable named AZURE_OPENAI_API_BASE")
+        self.azure_endpoint = azure_endpoint
+        self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
+        self.llm_client = AzureOpenAI(azure_endpoint=self.azure_endpoint, api_key=self.api_key, api_version=self.api_version)
+        self.cost = 0.
+    # @backoff.on_exception(backoff.expo, (APIConnectionError, APIError, RateLimitError), max_tries=10)
+    def generate(self, messages, temperature=0., max_new_tokens=None, **kwargs):
+        '''Generate the next message based on previous messages'''
+        completion = self.llm_client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=max_new_tokens if max_new_tokens else 4096,
+            temperature=temperature,
+            **kwargs,
+        )
+        total_tokens = completion.usage.total_tokens
+        self.cost +=  0.02 * ((total_tokens+500) / 1000)
+        return completion.choices[0].message.content
 
 class LLMAgent:
     def __init__(self, player_id, layout_name, model_name):
@@ -157,14 +190,15 @@ class LLMAgent:
         # self.model = 'mixtral'
 
         self.model_name = model_name
-        if 'gpt' in self.model_name:
-            self.model_type = 'openai'
-            self.model = self.model_name
-        else:
-            self.model_type = 'mistral'
-            self.model = 'mixtral'
+        #if 'gpt' in self.model_name:
+        #    self.model_type = 'openai'
+        #    self.model = self.model_name
+        #else:
+        #    self.model_type = 'mistral'
+        #    self.model = 'mixtral'
 
-        self.llm = LLMManager(model_name=self.model_name, model_type=self.model_type, cache_dir=os.getenv('HF_HOME'))
+        #self.llm = LLMManager(model_name=self.model_name, model_type=self.model_type, cache_dir=os.getenv('HF_HOME'))
+        self.llm = LMMEngineAzureOpenAI(AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_BASE, model_name,  api_version="2024-02-01")
 
         self.experiment_type = 'ai'
         
@@ -381,7 +415,7 @@ class LLMAgent:
         return state_for_llm
     
     def _add_history(self):
-        description = f'''action history: {', '.join(self.action_history[-5:])}.\n'''
+        description = f'''action history: {', '.join(self.action_history)}.\n'''
         add_to_dict_list(self.log_csv_dict, f"action_history", self.action_history)
         return description
 
@@ -405,7 +439,7 @@ class LLMAgent:
                 if d[0] == 'infinite':
                     description += f"{obj_type[0]}{idx} is inaccessible. "
                 elif 'blocked' in d[0]:
-                    description += f"{obj_type[0]}{idx} is {d[0]}"
+                    description += f"{obj_type[0]}{idx} is {d[0]}. "
                 else:
                     description += f"{obj_type[0]}{idx} is {d[0]} units away. "
 
@@ -430,7 +464,7 @@ class LLMAgent:
                             if d[0] == 'infinite':
                                 description += f'k{idx} is inaccessible. '
                             elif 'blocked' in d[0]:
-                                description += f"k{idx} is {d[0]} " 
+                                description += f"k{idx} is {d[0]}. " 
                             else:
                                 description += f"k{idx} is {d[0]} units away. "
                                 description += f"k{idx} contains {state_for_llm['kitchen_counter_objects'][idx]}. " 
@@ -727,3 +761,699 @@ class LLMAgent:
         
         return selected_action, message 
 
+class ReflexionAgent(LLMAgent):
+    def __init__(self, player_id, layout_name, model_name):
+        super().__init__(self, player_id, layout_name, model_name)
+
+        self.base_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. {EnvDescriptions[self.layout_name]}
+        Overcooked has the following rules: {self.rules}. We have agreed to follow the following high-level conventions: {self.conventions}. We have just finished a match and need you to reflect on how we performed. If there is something I can do to perform better next match, please identify it. Do not say anything else. Got it?'''
+
+        if self.model_type == 'openai':
+            self.message = [
+                        {"role": "system", "content": self.llm_system_prompt},
+                        {"role": "user", "content": self.base_prompt},
+                        {"role": "assistant", "content": self.assistant_response_initial},
+                    ]
+        else:
+            self.message = [
+                        {"role": "user", "content": self.base_prompt},
+                        {"role": "assistant", "content": self.assistant_response_initial},
+                    ]
+    def get_reflection(self, message):
+        reflection_msg = self.message + [{"role": "user", "content": f"{message}"}]
+        response_string = self.llm.inference_fn(reflection_msg)
+        print(f"{bcolors.OKGREEN}REFLECTION: {response_string}{bcolors.ENDC}")
+        return response_string
+
+class ScriptedAgent:
+    def __init__(self, player_id, layout_name, script_name):
+        self.player_id = player_id
+        self.layout_name = layout_name
+        self.player_names = ['Alice', 'Bob']
+        
+
+        # Controls 
+        self.DEBUG = False      
+        self.enable_cache = False # True    
+        self.write_to_cache = False 
+        self.save_trajectory = True # True 
+        # Enable kitchen counters only for GPT-4, other models cannot handle the complexity
+        self.enable_kitchen_counters = True   
+        self.explicit_help = False 
+        self.single_agent_ablation = True  
+        #self.log_replay = pd.read_csv(f'~/llm_coordination/src/agentic_evals/game_logs/ai/forced_coordination/forced_coordination_ai_scripted_player_{self.player_id}_2024-10-09.csv')
+        #self.replay_actions = list(self.log_replay['selected_action'])
+        # self.model = 'gpt-4-0125'
+        # self.model_name = 'gpt-4-0125'
+        # self.model = 'gpt-35-turbo'
+        # self.model_name = 'gpt-35-turbo'
+        # self.model_type = 'openai'
+        # self.model_name = 'mistralai/Mixtral-8x7B-Instruct-v0.1'
+        # self.model_type = 'mistral'
+        # self.model = 'mixtral'
+
+        # TODO::
+        #if 'gpt' in self.script_name:
+        #    self.model_type = 'openai'
+        #    self.script = self.script_name
+        #else:
+        #    self.model_type = 'mistral'
+        #    self.script = 'mixtral'
+
+        self.script_name = script_name
+
+        if script_name == 'do_nothing':
+            self.follow_script = self.do_nothing # LLMManager(model_name=self.model_name, model_type=self.model_type, cache_dir=os.getenv('HF_HOME'))
+        elif script_name == 'onion_only':
+            self.follow_script = self.onion_only
+
+        self.experiment_type = 'ai'
+        
+        ### LOGGING ###
+        self.time_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.trial_note = f'{self.layout_name}_{self.experiment_type}_{self.script_name}'        
+        self.trajectory_dir = f'game_trajectories/{self.experiment_type}/{self.layout_name}/'
+        self.log_dir = f'game_logs/{self.experiment_type}/{self.layout_name}/'
+        if not os.path.isdir(self.trajectory_dir):
+            os.makedirs(self.trajectory_dir)
+        if not os.path.isdir(self.log_dir):
+            os.makedirs(self.log_dir)
+        self.trajectory_path = self.trajectory_dir + f'/{self.trial_note}_player_{self.player_id}_{self.time_stamp}.npy'
+        ####
+        ### LOGGING ###
+        
+        self.action_set = LLMActionSet[self.layout_name]
+        #self.num_api_calls = 0 
+        self.player_actions = []
+
+        # Set other player ID 
+        if int(self.player_id) == 0:
+            self.other_player_id = 1
+        else:
+            self.other_player_id = 0
+
+
+        #self.llm_system_prompt = "You are a friendly chat assistant who is correct and brief at all times."
+        self.partner_action_inference_string = ''
+
+        #self.rules = f'''Players must coordinate to make onion soups with 3 onions each. Once a soup is cooked it needs to be placed on a plate and delivered. Players can only carry one item at a time. A soup can only be loaded onto plate by a player if they are holding a plate. The goal is to maximize the number of deliveries.'''
+
+        #self.conventions_explicit_help = f'''
+        #1. We will try to maximize the number of deliveries. 
+        #2. We will try to be efficient and prepare for the next soup while the current soup is cooking. 
+        #3. If we are in the same section, we will minimize our movement to avoid getting in each other's way.
+        #4. We will prefer helping the other player with their cooking and delivery if the situation arises.'''
+
+
+
+        #self.conventions = f'''1. We want to be efficient and prepare for the next soup while the current soup is cooking. 
+        #'''
+
+        #self.pi_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. {EnvDescriptions[self.layout_name]} 
+        #Overcooked has the following rules: {self.rules}. We have agreed to follow the following conventions: {self.conventions}. I'll provide my action history, current state, teammate's status, and my possible actions. Help me understand my partner's intentions and needs. describe what my partner intends to do or needs in one sentence only. Do not say anything else.'''
+
+        #self.verifier_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. {EnvDescriptions[self.layout_name]} 
+        #Overcooked has the following rules: {self.rules}. We have agreed to follow the following conventions: {self.conventions}.'''
+
+        #self.verifier_system_prompt = 'You are an action verification agent for Overcooked. I will provide you with my inventory, location information, and state information for me and my partner and my selected action. You need to check whether the action satisfies the criteria: 1. Rule Following: It follows to the rules of the game. 2. Convention Following: It adheres to the mentioned conventions 3. Safety: The selected action does not lead to the game being stuck. Your response should be Reasoning:<Brief Reasoning for Verification> followed by "Verification: Okay" if selected action follows **all three** criteria and "Verification: Not Okay" otherwise. Do not say anything else. Got it?'
+        
+
+        # With COT
+        # self.base_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. {EnvDescriptions[self.layout_name]} 
+        # Overcooked has the following rules: {self.rules}. We have agreed to follow the following conventions: {self.conventions}. I'll provide my action history, current state, teammate's status, and my possible actions. Help me select the best action from the list. Format your response as: Explanation:<Brief explanation for my next action>. Action: <action>. Only select one action. Do not say anything else. Got it?'''
+
+        # Without COT
+        #self.base_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. {EnvDescriptions[self.layout_name]}
+        #Overcooked has the following rules: {self.rules}. We have agreed to follow the following conventions: {self.conventions}. I'll provide my action history, current state, teammate's status, and my possible actions. Help me select the best action from the list. Format your response as: Action: <action>. Only select one action. Do not say anything else. Got it?'''
+
+        # self.base_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. Overcooked has the following rules: {self.rules}. We have agreed to follow the following conventions: {self.conventions}. I'll provide my action history, current state, teammate's status, and my possible actions. Help me select the best action from the list. Format your response as: Action: <action>. Only select one action. Do not say anything else. Got it?'''
+        #self.assistant_response_initial = f'''Got it!'''
+
+        self.action_regex = r"Action:\s*(.*)"
+
+        self.message = "This is a scripted agent that sticks to one specific convention. "
+
+        #if self.model_type == 'openai':
+        #    self.message = [
+        #                {"role": "system", "content": self.llm_system_prompt},
+        #                {"role": "user", "content": self.base_prompt},
+        #                {"role": "assistant", "content": self.assistant_response_initial},
+        #            ]
+        #    self.pi_message = [
+        #                {"role": "system", "content": self.llm_system_prompt},
+        #                {"role": "user", "content": self.pi_prompt},
+        #                {"role": "assistant", "content": self.assistant_response_initial},
+        #    ]
+        #    self.verifier_base_message = [
+        #                {"role": "system", "content": self.verifier_system_prompt},
+        #                {"role": "user", "content": self.base_prompt},
+        #                {"role": "assistant", "content": self.assistant_response_initial},
+        #    ]
+        #else:
+        #    self.message = [
+        #                {"role": "user", "content": self.base_prompt},
+        #                {"role": "assistant", "content": self.assistant_response_initial},
+        #            ]
+
+        #self.summary_so_far = ''
+        #self.tokens_used = 0 
+        if self.enable_cache:  
+            if os.path.isfile(self.cache_path):
+                self.cache = json.load(open(self.cache_path, 'r'))
+            else:
+                self.cache = {}
+        else:
+            self.cache = {}
+        
+        self.all_actions = []
+        for key, value in self.action_set.items():
+            if isinstance(value, list):
+                self.all_actions.extend(value)
+        # print(self.all_actions)
+        self.log_csv_dict = {}
+        self.action_history = []
+
+    def do_nothing(self, state_for_script):
+        return 'wait.'
+
+    def onion_only(self, state_for_script):
+        #pdb.set_trace()
+        # If agent is holding nothing...
+        if state_for_script[self.player_id]['held_object'] == 'nothing':
+            # find closest onion_dispenser
+            closest_dispenser = None
+            shortest_distance = 100
+
+            # Iterate through each dispenser
+            for i, dispenser_dist in enumerate(state_for_script['distances']['onion_dispenser']):
+                # Check if the string is longer than 2 characters (i.e. it's blocked)
+                if len(dispenser_dist[0]) > 2:
+                    #print(f"Dispenser is blocked: {dispenser}")
+                    continue  # Skip this dispenser since it is blocked
+                
+                distance = int(dispenser_dist[0])
+
+                # Find the closest unblocked dispenser
+                if distance < shortest_distance:
+                    shortest_distance = distance
+                    closest_dispenser = i
+
+            print("closest dispenser: ", closest_dispenser)
+            if closest_dispenser == None:
+                return 'wait.'
+            else:
+                action = "pick up onion from o" + str(closest_dispenser) + "."
+                print("ACTION: ", action)
+                return action
+            
+        # else, if agent is already holding an onion...
+        else:
+            # find closest cooker
+            closest_cooker = None
+            shortest_distance = 100
+
+            # Iterate through each cooker
+            for i, cooker_dist in enumerate(state_for_script['distances']['cooker']):
+                # skip this cooker if already full
+                if state_for_script['num_onions_in_pot'][i] == 3:
+                    continue
+
+                # Check if the string is longer than 2 characters (i.e. it's blocked)
+                if len(cooker_dist[0]) > 2:
+                    #print(f"cooker is blocked: {cooker}")
+                    continue  # Skip this cooker since it is blocked
+                    
+                distance = int(cooker_dist[0])
+
+                # Find the closest unblocked cooker
+                if distance < shortest_distance:
+                    shortest_distance = distance
+                    closest_cooker = i
+
+            if closest_cooker == None:
+                return 'wait.'
+            else:
+                action = "place onion in c" + str(closest_cooker) + "."
+                print("ACTION: ", action)
+                return action
+
+    
+    def _get_available_actions(self, state_for_script, message):
+        # Available Action Constraints
+        available_actions = []
+        # Check what player is holding 
+        if state_for_script[self.player_id]['held_object'] == "nothing":
+            for idx, d in enumerate(state_for_script['distances']['onion_dispenser']):
+                if d[0] not in ['infinite']:
+                    available_actions.append(self.action_set['onion_dispenser'][idx])
+
+            for idx, d in enumerate(state_for_script['distances']['plate_dispenser']):
+                if d[0] not in ['infinite']:
+                    available_actions.append(self.action_set['plate'][idx])
+            
+            if self.enable_kitchen_counters:
+            
+                for idx, d in enumerate(state_for_script['distances']['kitchen_counter']):
+                    if d[0] not in ['infinite'] and state_for_script['kitchen_counter_objects'][idx] == 'onion':
+                        available_actions.append(self.action_set['kitchen_counter_pick_onion'][idx])
+                    if d[0] not in ['infinite'] and state_for_script['kitchen_counter_objects'][idx] == 'plate':
+                        available_actions.append(self.action_set['kitchen_counter_pick_plate'][idx])
+                    if d[0] not in ['infinite'] and state_for_script['kitchen_counter_objects'][idx] == 'soup in plate':
+                        available_actions.append(self.action_set['kitchen_counter_pick_soup'][idx])
+
+
+            if 'storage_counter_pick_onion' in self.action_set:
+                for idx, d in enumerate(state_for_script['distances']['storage_counter']):
+                    if d[0] not in ['infinite']:
+                        if state_for_script['storage_counter_objects'][idx] == 'onion':
+                            available_actions.append(self.action_set['storage_counter_pick_onion'][idx])
+                        elif state_for_script['storage_counter_objects'][idx] == 'plate':
+                            available_actions.append(self.action_set['storage_counter_pick_plate'][idx])
+                        elif state_for_script['storage_counter_objects'][idx] == 'soup in plate':
+                            available_actions.append(self.action_set['storage_counter_pick_soup'][idx])
+            
+            for idx, d in enumerate(state_for_script['distances']['gate']):
+                if d[0] not in ['infinite']:
+                    if state_for_script['gate_status'][idx] == 'closed':
+                        available_actions.append(self.action_set['gate'][idx])
+
+            # Add turn on cooker to instruction instead of internal mechanism
+            # for idx, d in enumerate(state_for_script['distances']['cooker']):
+            #     if d[0] != 'infinite':
+            #         available_actions.append(self.action_set['cooking_status'][idx])
+
+        elif state_for_script[self.player_id]['held_object'] == 'onion':
+            for idx, d in enumerate(state_for_script['distances']['cooker']):
+                if d[0] not in ['infinite']:
+                    available_actions.append(self.action_set['cooker'][idx])
+
+            if self.enable_kitchen_counters:
+                if len(self.empty_kitchen_counters)>0:
+                    
+                    kidx = self.empty_kitchen_counter_distances.index(min(self.empty_kitchen_counter_distances))
+                    
+                    k_action = self.action_set['kitchen_counter_place_onion'][kidx]
+                    
+                    available_actions.append(k_action)
+
+            if 'storage_counter_place_onion' in self.action_set:
+                for idx, d in enumerate(state_for_script['distances']['storage_counter']):
+                    if d[0] not in ['infinite']:
+                        if state_for_script['storage_counter_objects'][idx] == 'empty':
+                            available_actions.append(self.action_set['storage_counter_place_onion'][idx])
+
+        elif state_for_script[self.player_id]['held_object'] == 'plate':
+            for idx, d in enumerate(state_for_script['distances']['cooker']):
+                if d[0] not in ['infinite']:
+                    available_actions.append(self.action_set['cooked_soup'][idx])
+            
+            if self.enable_kitchen_counters:
+                if len(self.empty_kitchen_counters)>0:
+                    kidx = self.empty_kitchen_counter_distances.index(min(self.empty_kitchen_counter_distances))
+                    
+                    k_action = self.action_set['kitchen_counter_place_plate'][kidx]
+                    
+                    available_actions.append(k_action)
+
+            if 'storage_counter_place_plate' in self.action_set:
+                for idx, d in enumerate(state_for_script['distances']['storage_counter']):
+                    if d[0] not in ['infinite']:
+                        if state_for_script['storage_counter_objects'][idx] == 'empty':
+                            available_actions.append(self.action_set['storage_counter_place_plate'][idx])
+
+        elif state_for_script[self.player_id]['held_object'] == 'soup in plate':
+            for idx, d in enumerate(state_for_script['distances']['delivery_zone']):
+                if d[0] not in ['infinite']:
+                    available_actions.append(self.action_set['delivery_area'][idx])
+            if self.enable_kitchen_counters:
+                if len(self.empty_kitchen_counters)>0:
+                    kidx = self.empty_kitchen_counter_distances.index(min(self.empty_kitchen_counter_distances))
+                    
+                    k_action = self.action_set['kitchen_counter_place_plate'][kidx]
+                    
+                    available_actions.append(k_action)
+
+            if 'storage_counter_place_soup' in self.action_set:
+                for idx, d in enumerate(state_for_script['distances']['storage_counter']):
+                    if d[0] not in ['infinite']:
+                        if state_for_script['storage_counter_objects'][idx] == 'empty':
+                            available_actions.append(self.action_set['storage_counter_place_soup'][idx])
+        return available_actions + self.action_set['wait'] + self.action_set['collision_avoidance']
+
+    def _correct_dish_to_plate(self, state_for_script):
+        if state_for_script[self.player_id ]['held_object'] == 'dish':
+            state_for_script[self.player_id ]['held_object'] = 'plate'
+        
+        if state_for_script[self.other_player_id]['held_object'] == 'dish':
+            state_for_script[self.player_id ]['held_object'] = 'plate'
+        return state_for_script
+    
+    def _add_history(self):
+        description = f'''action history: {', '.join(self.action_history)}.\n'''
+        add_to_dict_list(self.log_csv_dict, f"action_history", self.action_history)
+        return description
+
+    def _add_held_object_info(self, state_for_script):
+
+        description = f'''<Inventory>: I am holding {state_for_script[self.player_id ]['held_object']}. {self.player_names[self.other_player_id]} is holding {state_for_script[self.other_player_id ]['held_object']}. '''
+        if self.single_agent_ablation:
+            description = f'''<Inventory>: I am holding {state_for_script[self.player_id ]['held_object']}. '''
+        
+        add_to_dict_list(self.log_csv_dict, f"player_held_object", state_for_script[self.player_id ]['held_object'])
+        add_to_dict_list(self.log_csv_dict, f"other_player_held_object", state_for_script[self.other_player_id ]['held_object'])
+        return description
+    
+    def _add_kitchen_facility_info_single_agent_ablation(self, state_for_script):
+        # TODO: Add kitchen counter distances to both Bob and Alice's
+        self.empty_kitchen_counters = []
+        self.empty_kitchen_counter_distances = []
+        description = f"<My location information:> "
+        for obj_type in ['onion_dispenser', 'plate_dispenser', 'delivery_zone', 'cooker', 'storage_counter', 'gate']:
+            for idx, d in enumerate(state_for_script['distances'][obj_type]):
+                if d[0] == 'infinite':
+                    description += f"{obj_type[0]}{idx} is inaccessible. "
+                elif 'blocked' in d[0]:
+                    description += f"{obj_type[0]}{idx} is {d[0]}. "
+                else:
+                    description += f"{obj_type[0]}{idx} is {d[0]} units away. "
+
+                add_to_dict_list(self.log_csv_dict, f"{obj_type[0]}{idx}_distance_from_{self.player_names[self.player_id]}", str(d[0]))
+
+            
+        description += f"\n<Environment Details>: "
+        for obj_type in ['cooker', 'storage_counter', 'kitchen_counter', 'gate']:
+            for idx, d in enumerate(state_for_script['distances'][obj_type]):
+                if obj_type == 'cooker':
+                        description += f"c{idx} contains {state_for_script['num_onions_in_pot'][idx]} out of 3 onions. "
+                        add_to_dict_list(self.log_csv_dict, f"c{idx}_num_onions", state_for_script['num_onions_in_pot'][idx])
+                        description += f"c{idx} is {state_for_script['cooker_status'][idx]}. "
+                        add_to_dict_list(self.log_csv_dict, f"c{idx}_cooker_status", state_for_script['cooker_status'][idx])
+                        description += f"soup in c{idx} is {state_for_script['soup_in_cooker_status'][idx]}. "
+                        # if state_for_script['soup_in_cooker_status'][idx] == 'still cooking':
+                        #     description += f"soup in c{idx} needs {state_for_script['soup_in_cooker_remaining_time'][idx]} timesteps to cook. "
+                        add_to_dict_list(self.log_csv_dict, f"c{idx}_soup_in_cooker_status", state_for_script['soup_in_cooker_status'][idx])
+                if self.enable_kitchen_counters:
+                    if obj_type == 'kitchen_counter':
+                        if state_for_script['kitchen_counter_objects'][idx] != 'empty':
+                            if d[0] == 'infinite':
+                                description += f'k{idx} is inaccessible. '
+                            elif 'blocked' in d[0]:
+                                description += f"k{idx} is {d[0]} " 
+                            else:
+                                description += f"k{idx} is {d[0]} units away. "
+                                description += f"k{idx} contains {state_for_script['kitchen_counter_objects'][idx]}. " 
+                            self.empty_kitchen_counter_distances.append(float('inf'))
+                        else:
+                            if d[0] in ['infinite'] or 'blocked' in d[0]:
+                                self.empty_kitchen_counter_distances.append(float('inf'))
+                            else:
+                                self.empty_kitchen_counter_distances.append(int(d[0]))
+                                self.empty_kitchen_counters.append(f'k{idx}')
+                
+                if obj_type == 'gate':
+                    if d[0] not in ['infinite']:
+                        description += f"g{idx} is {state_for_script['gate_status'][idx]}. "
+                        if state_for_script['gate_status'][idx] == 'open':
+                            description += f"g{idx} will stay open for {10 - state_for_script['gate_open_time'][idx]} timesteps. "
+
+                if self.layout_name in ['forced_coordination', 'counter_circuit_o_1order', 'soup_passing']:   
+                    if obj_type == 'storage_counter':
+                        if state_for_script['storage_counter_objects'][idx] == 'empty':
+                            description += f"s{idx} is empty. "
+                        else:
+                            description += f"s{idx} contains {state_for_script['storage_counter_objects'][idx]}. "
+                        add_to_dict_list(self.log_csv_dict, f"s{idx} object", state_for_script['storage_counter_objects'][idx]) 
+
+                # When there are no kitchen counters:
+        if self.enable_kitchen_counters:
+            if len(self.empty_kitchen_counter_distances) > 0:
+                closest_kitchen_counter = self.empty_kitchen_counter_distances.index(min(self.empty_kitchen_counter_distances))
+                distance_to_closest_kitchen_counter = min(self.empty_kitchen_counter_distances)
+                # print('Number of kitchen counters: ', len(self.empty_kitchen_counter_distances))
+                if distance_to_closest_kitchen_counter != float('inf'):
+                    description += f'Closest empty kitchen counter k{closest_kitchen_counter} is {distance_to_closest_kitchen_counter} units away. '
+
+        return description
+
+
+    def _add_kitchen_facility_info(self, state_for_script):
+        # TODO: Add kitchen counter distances to both Bob and Alice's
+        self.empty_kitchen_counters = []
+        self.empty_kitchen_counter_distances = []
+        description = f"<My location information:> "
+        for obj_type in ['onion_dispenser', 'plate_dispenser', 'delivery_zone', 'cooker', 'storage_counter', 'gate']:
+            for idx, d in enumerate(state_for_script['distances'][obj_type]):
+                if d[0] == 'infinite':
+                    description += f"{obj_type[0]}{idx} is inaccessible. "
+                elif 'blocked' in d[0]:
+                    description += f"{obj_type[0]}{idx} is {d[0]} by {self.player_names[self.other_player_id]}. "
+                else:
+                    description += f"{obj_type[0]}{idx} is {d[0]} units away. "
+
+                add_to_dict_list(self.log_csv_dict, f"{obj_type[0]}{idx}_distance_from_{self.player_names[self.player_id]}", str(d[0]))
+    
+        if not self.single_agent_ablation:
+            description += f"\n<{self.player_names[self.other_player_id]}'s location information>: "
+            for obj_type in ['onion_dispenser', 'plate_dispenser', 'delivery_zone', 'cooker', 'storage_counter', 'gate']:
+                for idx, d in enumerate(state_for_script['distances'][obj_type]):
+                    if d[1] == 'infinite':
+                        description += f"{obj_type[0]}{idx} is inaccessible. "
+                    elif 'blocked' in d[1]:
+                        description += f"{obj_type[0]}{idx} is {d[0]} by {self.player_names[self.player_id]}. "  
+                    else:
+                        description += f"{obj_type[0]}{idx} is {d[1]} units away. "
+                    
+                    add_to_dict_list(self.log_csv_dict, f"{obj_type[0]}{idx}_distance_from_{self.player_names[self.other_player_id]}", str(d[1]))
+            
+        description += f"\n<Environment Details>: "
+        for obj_type in ['cooker', 'storage_counter', 'kitchen_counter', 'gate']:
+            for idx, d in enumerate(state_for_script['distances'][obj_type]):
+                if obj_type == 'cooker':
+                        description += f"c{idx} contains {state_for_script['num_onions_in_pot'][idx]} out of 3 onions. "
+                        add_to_dict_list(self.log_csv_dict, f"c{idx}_num_onions", state_for_script['num_onions_in_pot'][idx])
+                        description += f"c{idx} is {state_for_script['cooker_status'][idx]}. "
+                        add_to_dict_list(self.log_csv_dict, f"c{idx}_cooker_status", state_for_script['cooker_status'][idx])
+                        description += f"soup in c{idx} is {state_for_script['soup_in_cooker_status'][idx]}. "
+                        # if state_for_script['soup_in_cooker_status'][idx] == 'still cooking':
+                        #     description += f"soup in c{idx} needs {state_for_script['soup_in_cooker_remaining_time'][idx]} timesteps to cook. "
+                        add_to_dict_list(self.log_csv_dict, f"c{idx}_soup_in_cooker_status", state_for_script['soup_in_cooker_status'][idx])
+                if self.enable_kitchen_counters:
+                    if obj_type == 'kitchen_counter':
+                        if state_for_script['kitchen_counter_objects'][idx] != 'empty':
+                            if d[0] == 'infinite':
+                                description += f'k{idx} is inaccessible. '
+                            elif 'blocked' in d[0]:
+                                description += f"k{idx} is {d[0]} by {self.player_names[int(self.other_player_id)]}. " 
+                            else:
+                                description += f"k{idx} is {d[0]} units away. "
+                                description += f"k{idx} contains {state_for_script['kitchen_counter_objects'][idx]}. " 
+                            self.empty_kitchen_counter_distances.append(float('inf'))
+                        else:
+                            if d[0] in ['infinite'] or 'blocked' in d[0]:
+                                self.empty_kitchen_counter_distances.append(float('inf'))
+                            else:
+                                self.empty_kitchen_counter_distances.append(int(d[0]))
+                                self.empty_kitchen_counters.append(f'k{idx}')
+                
+                if obj_type == 'gate':
+                    if d[0] not in ['infinite']:
+                        description += f"g{idx} is {state_for_script['gate_status'][idx]}. "
+                        if state_for_script['gate_status'][idx] == 'open':
+                            description += f"g{idx} will stay open for {10 - state_for_script['gate_open_time'][idx]} timesteps. "
+
+                if self.layout_name in ['forced_coordination', 'counter_circuit_o_1order', 'soup_passing']:   
+                    if obj_type == 'storage_counter':
+                        if state_for_script['storage_counter_objects'][idx] == 'empty':
+                            description += f"s{idx} is empty. "
+                        else:
+                            description += f"s{idx} contains {state_for_script['storage_counter_objects'][idx]}. "
+                        add_to_dict_list(self.log_csv_dict, f"s{idx} object", state_for_script['storage_counter_objects'][idx]) 
+
+                # When there are no kitchen counters:
+        if self.enable_kitchen_counters:
+            if len(self.empty_kitchen_counter_distances) > 0:
+                closest_kitchen_counter = self.empty_kitchen_counter_distances.index(min(self.empty_kitchen_counter_distances))
+                distance_to_closest_kitchen_counter = min(self.empty_kitchen_counter_distances)
+                # print('Number of kitchen counters: ', len(self.empty_kitchen_counter_distances))
+                if distance_to_closest_kitchen_counter != float('inf'):
+                    description += f'Closest empty kitchen counter k{closest_kitchen_counter} is {distance_to_closest_kitchen_counter} units away. '
+
+        return description
+    
+    def _parse_and_add_dialog(self, other_player_message):
+        description = ''
+        if other_player_message != '':
+            description += f' {self.player_names[self.other_player_id]} says: {other_player_message}'
+            
+        add_to_dict_list(self.log_csv_dict, f"other_player_message", other_player_message)
+        
+        return description
+
+    def infer_partner_state(self, description):
+        partner_inference_message = self.pi_message + [{"role": "user", "content": f"{description}"}]
+        epistemic_response_string = self.llm.inference_fn(partner_inference_message)
+        print(f"{bcolors.OKGREEN}PARTNER INFERENCE: {epistemic_response_string}{bcolors.ENDC}")
+        return epistemic_response_string
+
+    def _state_to_description(self, state_for_script, other_player_message):
+        print('STATE FOR SCRIPTED AGENT: ', state_for_script)
+        state_for_script = self._correct_dish_to_plate(state_for_script)
+        description = self._add_history() 
+        # Add state information in natural language 
+        description += self._add_held_object_info(state_for_script)
+        if not self.single_agent_ablation:
+            description += self._add_kitchen_facility_info(state_for_script)
+        else:
+            description += self._add_kitchen_facility_info_single_agent_ablation(state_for_script)
+
+
+        # get available actions based on current state and add the information to the description
+        self.available_actions_list = self._get_available_actions(state_for_script, None)
+        # Uncomment for ToM Reasoning LLM
+        # self.partner_inference_string = self.infer_partner_state(description)
+        # description += self.partner_inference_string
+        available_actions = ', '.join(self.available_actions_list)
+        description += f"\nAvailable Actions:\n[{available_actions}]"
+        add_to_dict_list(self.log_csv_dict, f"available_actions", " | ".join(self.available_actions_list))
+
+        return description
+
+
+    def find_best_match(self, action_string):
+        match = re.search(self.action_regex, action_string.strip())
+        if match:
+            selected_match = match.group(1).strip().lower()
+
+            # Sometimes model repeats Action: withing the action string
+            if 'action:' in selected_match.lower():
+                updated_action_regex = r"action:\s*(.*)"
+                match = re.search(updated_action_regex, selected_match.strip())
+                if match:
+                    selected_match = match.group(1).strip().lower()
+            ####
+            for action in self.available_actions_list:
+                if selected_match.lower() in action.lower():
+                    return action 
+            selected_move, score = process.extractOne(selected_match, self.available_actions_list)
+        else:
+            selected_move = np.random.choice(self.available_actions_list)
+        return selected_move
+    
+    def get_player_action(self, state_for_script, other_player_message):
+        #pdb.set_trace()
+        state_description = self._state_to_description(state_for_script, other_player_message)
+        #response_string = ''
+        message = ''
+        print(f"{bcolors.HEADER}CURRENT PLAYER: {self.player_names[self.player_id]}{bcolors.ENDC}")
+        print(f"{bcolors.FAIL}{state_description}{bcolors.ENDC}")
+        
+        if self.DEBUG:
+            selected_action = 'wait.'
+            selected_action = self.replay_actions.pop(0)
+            return selected_action, '' 
+        elif len(self.player_actions) > 0:
+            selected_action = self.player_actions.pop(0)
+            message = ''
+            add_to_dict_list(self.log_csv_dict, 'full_state_description', state_description)
+            add_to_dict_list(self.log_csv_dict, 'selected_action', selected_action)
+            add_to_dict_list(self.log_csv_dict, 'llm_response', 'LLM NOT USED') 
+
+            self.action_history.append(selected_action)
+            if self.save_trajectory:
+                np.save(self.trajectory_path,self.action_history)
+        else:
+            try: 
+                # cache which contains the selected action as value 
+                state_only_desc = state_description[state_description.find('state:'):]
+                if self.enable_cache and state_only_desc in self.cache:
+                    action, message = self.cache[state_only_desc]
+                else:
+                    if len(self.available_actions_list) > 1:
+                        # TODO::
+                        messages = self.message + state_description
+                        #response_string = self.llm.inference_fn(messages=messages)
+                        #print(f'''{bcolors.WARNING}LLM RESPONSE: {response_string}{bcolors.ENDC}''')
+                        
+                        action = self.follow_script(state_for_script)
+
+
+                        ### Uncomment for verifier LLM ###
+                        # verification_response_string = ''
+                        # verifier_responses = []
+                        # verifier_description = f"State: {state_description.replace(self.partner_action_inference_string, '')}\n\n My Solution: {action}. Think step by step. Think about safety, think about rules, think about conventions. "
+                        # print(f'''{bcolors.WARNING}VERIFIER INPUT: {verifier_description}{bcolors.ENDC}''')
+                        # self.verifier_message = self.verifier_base_message + [{"role": "user", "content": verifier_description}]
+                        # verification_response_string = self.llm.inference_fn(self.verifier_message)
+                        # self.num_api_calls += 1
+                        # verifier_responses.append(verification_response_string)
+                        # print(f'''{bcolors.OKCYAN}VERIFICATION RESPONSE: {verification_response_string}{bcolors.ENDC}''')
+                        # counter = 0 
+                        # while 'verification: okay' not in verification_response_string.lower(): 
+                        #     if action in self.available_actions_list:  
+                        #         self.available_actions_list.remove(action)
+                        #     counter += 1
+                        #     self.generator_message.append({"role": "assistant", "content": response_string})
+                        #     updated_generator_message = f"Your selected action: {action} is not appropriate. {verification_response_string}. Please choose another action. List of Available Actions:\n{self.available_actions_list}"
+
+
+                        #     messages.append({"role": "user", "content": updated_generator_message})
+                            
+                        #     response_string = self.llm.inference_f(messages)
+                        #     self.num_api_calls += 1
+                        #     print(f"{bcolors.WARNING}LLM CORRECTED RESPONSE: {response_string}{bcolors.ENDC}") 
+                        #     action = self.find_best_match(response_string)
+
+                        #     self.verifier_message[-1]["content"] = f"State: {state_description.replace(self.partner_action_inference_string, '')}\n\n My Solution: {action}. Think step by step. Think about safety, think about rules, think about conventions. "
+
+                        #     verification_response_string = self.llm.inference_f(self.verifier_message)
+                        #     self.num_api_calls += 1
+                        #     verifier_responses.append(verification_response_string) 
+                        #     print(f'''{bcolors.OKCYAN}VERIFICATION RESPONSE: {verification_response_string}{bcolors.ENDC}''')
+                            
+                        # add_to_dict_list(self.log_csv_dict, 'VERIFICATION Response', ' ***** '.join(verifier_responses)) 
+
+                        # verification_string = self.llm.inference_fn(messages=self.verifier_message + [{"role": "user", "content": f"My selected Action: {action}"}])
+                        # print('VERIFIER RESPONSE: ', verification_string)
+                        # while 'Verification: Okay' not in verification_string:
+                        #     messages += [{"role": "assistant", "content": response_string}] 
+                        #     messages += [{"role": "user", "content": verification_string}]
+                        #     response_string = self.llm.inference_fn(messages=messages)
+                        #     print(f'''{bcolors.WARNING}LLM RESPONSE: {response_string}{bcolors.ENDC}''')
+                        #     action = self.find_best_match(response_string)
+                            
+                        #     verification_string = self.llm.inference_fn(messages=self.verifier_message + [{"role": "user", "content": f"My selected Action: {action}"}])
+
+                    else:
+                        action = 'wait.'
+                    self.cache[state_only_desc] = (action, message)
+                    if self.write_to_cache:
+                        with open(self.cache_save_path, 'w') as f:
+                            json.dump(self.cache, f)
+                #print(f"{bcolors.OKBLUE}Number of API calls made by player {self.player_id}: {bcolors.ENDC}", self.num_api_calls)
+                # if action in self.all_actions:
+                if action in self.available_actions_list:
+                    selected_action = action 
+                else:
+                    print("WARNING: Script returned an action that is not in the defined action set. ")
+                    selected_action = 'wait.'
+
+            except Exception as e:
+                selected_action = 'wait.' 
+                print(f'Failed to get response from script for player {self.player_id} due to {e}')
+                # sys.exit(0)
+                time.sleep(1.)
+                pass
+            add_to_dict_list(self.log_csv_dict, 'full_state_description', state_description)
+            add_to_dict_list(self.log_csv_dict, 'selected_action', selected_action)
+            add_to_dict_list(self.log_csv_dict, 'llm_response', "LLM not used, scripted agent") 
+            
+            df = pd.DataFrame(self.log_csv_dict)
+            df.to_csv(f"game_logs/{self.experiment_type}/{self.layout_name}/{self.trial_note}_player_{self.player_id}_{self.time_stamp}.csv") 
+            
+            self.action_history.append(selected_action)
+            if self.save_trajectory:
+                np.save(self.trajectory_path,self.action_history)
+
+        print('SELECTED ACTION: ', selected_action) 
+        
+        return selected_action, message
