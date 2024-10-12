@@ -24,9 +24,6 @@ def set_global_seed(seed):
     np.random.seed(seed)
 
 set_global_seed(42)
-AZURE_OPENAI_API_BASE='REMOVED'
-AZURE_OPENAI_API_KEY='REMOVED'
-
 
 # When using openai API
 # openai.api_key = os.environ['API_KEY']
