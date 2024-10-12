@@ -72,8 +72,10 @@ class LLMAgent():
         self.llm_system_prompt = "A chat between a human and an assistant. The assistant is correct and brief at all times."
 
         self.partner_interpreter_base_prompt = f'''{self.base_prompt}
-        You are a Theory of Mind inference agent for the game Collab Escape. You will be provided with the current state including my location, my partner's location, and the killer's target if known. You will provide me with a short explanation about what my partner intends to do next based on the available information.
+        You are a Theory of Mind inference agent for the game Collab Escape. You will be provided with the current state including my location, my partner's location, and the killer's target if known. You will provide me with a short explanation about what my partner intends to do next based on the available information and how I can best support my partner.
         '''
+
+        self.verifier_system_prompt = "You are an action verification agent in the game CollabEscape. Please verify the action taken by the player is optimal and safe. If the action is optimal and safe please say verification:sucess. If not say verification:fail and provide feedback about why the action is inappropriate."
 
         self.assistant_response_initial = f'''Got it!'''
 
@@ -90,6 +92,11 @@ class LLMAgent():
                         {"role": "user", "content": self.partner_interpreter_base_prompt},
                         {"role": "assistant", "content": self.assistant_response_initial},
                     ]
+            self.verifier_base_message = [
+                {"role": "system", "content": self.verifier_system_prompt}, 
+                {"role": "user", "content": self.llm_system_prompt},
+                {"role": "assistant", "content": self.assistant_response_initial},
+            ]
         else:
             self.generator_message = [
                         {"role": "user", "content": self.generator_prompt},
@@ -241,13 +248,40 @@ class LLMAgent():
             pi_input = self.partner_interpreter_message + [{"role": "user", "content": state_description}]
             partner_interpretation = self.inference_fn(messages=pi_input)
             gen_input = self.generator_message + [{"role": "user", "content": state_description + partner_interpretation}]
-            response = self.inference_fn(messages=gen_input)
-            print(f'''{bcolors.WARNING}LLM RESPONSE: {response}{bcolors.ENDC}''')
-            action = self.find_best_match(response)
+            action_string = self.inference_fn(messages=gen_input)
+            print(f'''{bcolors.WARNING}LLM RESPONSE: {action_string}{bcolors.ENDC}''')
+            action = self.find_best_match(action_string)
             with open('game_state_gpt4_ToM_14.txt', 'a') as file:
                 file.write(state_description + "\n")
                 #file.write(partner_interpretation + "\n")
                 file.write(response + "\n")
+
+            ## Verification 
+            verifier_description = f"State: {state_description}\n\n My Solution: {action}. Think step by step. Think about safety. Think about optimality." # https://arxiv.org/pdf/2401.04925.pdf
+
+            self.verifier_message = self.verifier_base_message + [{"role": "user", "content": verifier_description}]
+            verification_response_string = self.inference_fn(self.verifier_message)
+
+            while 'verification: okay' not in verification_response_string.lower(): 
+                self.generator_message.append({"role": "assistant", "content": action_string})
+                updated_generator_message = f"Your selected action: {action} is not appropriate. {verification_response_string}. Please choose another action. List of Available Actions:\n"
+
+                self.generator_message.append({"role": "user", "content": updated_generator_message})
+                action_string = self.inference_fn(self.generator_message)
+                print(f"{bcolors.WARNING}LLM CORRECTED RESPONSE: {action_string}{bcolors.ENDC}") 
+                selected_move = self.find_best_match(action_string)
+                # Two Step Verification Only 
+                # if counter == 2:
+                #     break 
+                
+                # self.verifier_message.append({"role": "assistant", "content": verification_response_string})
+                # self.verifier_message.append({"role": "user", "content": f"New Solution: {selected_move}. "})
+                self.verifier_message[-1]["content"] = f"State: {state_description}\n\n My Solution: {selected_move}. Think step by step. Think about rules, think about conventions, and think about safety. "
+                print(self.verifier_message)
+                verification_response_string = self.inference_fn(self.verifier_message)
+                print(f'''{bcolors.OKCYAN}VERIFICATION RESPONSE: {verification_response_string}{bcolors.ENDC}''')
+                
+
         except Exception as e:
             action = 'wait' 
             print(f'Failed to get response from openai api for player {self.player_id} due to {e}')
@@ -260,6 +294,6 @@ class LLMAgent():
                 selected_action = 'wait'
         else:
             selected_action = 'wait'
-
+        print(f"{self.player_name} TAKING ACTION: ", selected_action)
         return selected_action
 
