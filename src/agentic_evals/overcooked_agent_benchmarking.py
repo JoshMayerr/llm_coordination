@@ -14,51 +14,24 @@ from tqdm import tqdm
 import argparse
 
 import pdb
-#from vllm import LLMEngine
-#
-#class LMMEngineAzureOpenAI(LMMEngine):
-#    def __init__(self, api_key=None, azure_endpoint=None, model=None, api_version=None, rate_limit=-1, **kwargs):
-#        assert model is not None, "model must be provided"
-#        self.model = model
-#        assert api_version is not None, "api_version must be provided"
-#        self.api_version = api_version
-#        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-#        if api_key is None:
-#            raise ValueError("An API Key needs to be provided in either the api_key parameter or as an environment variable named AZURE_OPENAI_API_KEY")
-#        self.api_key = api_key
-#        azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_API_BASE")
-#        if azure_endpoint is None:
-#            raise ValueError("An Azure API endpoint needs to be provided in either the azure_endpoint parameter or as an environment variable named AZURE_OPENAI_API_BASE")
-#        self.azure_endpoint = azure_endpoint
-#        self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
-#        self.llm_client = AzureOpenAI(azure_endpoint=self.azure_endpoint, api_key=self.api_key, api_version=self.api_version)
-#        self.cost = 0.
-#    # @backoff.on_exception(backoff.expo, (APIConnectionError, APIError, RateLimitError), max_tries=10)
-#    def generate(self, messages, temperature=0., max_new_tokens=None, **kwargs):
-#        '''Generate the next message based on previous messages'''
-#        completion = self.llm_client.chat.completions.create(
-#            model=self.model,
-#            messages=messages,
-#            max_tokens=max_new_tokens if max_new_tokens else 4096,
-#            temperature=temperature,
-#            **kwargs,
-#        )
-#        total_tokens = completion.usage.total_tokens
-#        self.cost +=  0.02 * ((total_tokens+500) / 1000)
-#        return completion.choices[0].message.content
 
 
-def main(layout_name, model_name, scripted_collab, reflexion):
+def main(layout_name, model_name, scripted_collab, reflections):
     mdp = OvercookedGridworld.from_layout_name(layout_name)
 
     if not scripted_collab:
         am = [LLMActionManager(mdp, 'player_0', layout_name, model_name),
               LLMActionManager(mdp, 'player_1', layout_name, model_name)]
     else:
-        am = [ScriptedActionManager(mdp, 'player_0', layout_name, 'do_nothing'),
+        am = [LLMActionManager(mdp, 'player_0', layout_name, model_name),
               ScriptedActionManager(mdp, 'player_1', layout_name, scripted_collab)]
-       
-        
+
+    #pdb.set_trace()
+    if reflections != '':
+        am[0].llm_agent.message.extend([
+            {"role": "user", "content": reflections},
+            {"role": "assistant", "content": "Thank you for this useful context!"}
+        ])
         
     state = mdp.get_standard_start_state()
     #print(am[0].llm_agent.model)
@@ -95,25 +68,26 @@ def main(layout_name, model_name, scripted_collab, reflexion):
         print(f"Current score is : {score}")
         time.sleep(0.5) # Delay to avoid overloading LLM API with calls
 
-    pdb.set_trace()
-    if reflexion:
+    #pdb.set_trace()
+    if reflections != '':
         reflexion_agent = LLMActionManager(mdp, 'player_0', layout_name, model_name, reflector=True)
-        prev_game_results = '\nFinal score: ' + score
-        prev_game_results += '\nMy action history: ' + am[0].llm_agent.self._add_history()
-        prev_game_results += '\nMy teammate\s action history: ' + am[1].llm_agent.self._add_history()
-        reflection = 'Reflection on previous match: ' + reflexion_agent.get_reflection(prev_game_results)
-        
-    return score
+        prev_game_results = 'My action history: ' + am[0].llm_agent.self._add_history()
+        prev_game_results += '\nMy teammate\'s action history: ' + am[1].llm_agent.self._add_history()
+        prev_game_results += '\nFinal score: ' + score
 
-def _read_history(self):
-    # Check if action history exists in the log
-    if "action_history" in self.log_csv_dict:
-        # Retrieve the action history from the log
-        action_history = self.log_csv_dict["action_history"]
-        # Format it as a string, joining the list items
-        return f"Action history: {', '.join(action_history)}."
-    else:
-        return "No action history found."
+        new_reflection = 'Reflection on previous match: ' + reflexion_agent.get_reflection(prev_game_results)
+        
+    return score, new_reflection
+
+#def _read_history(self):
+#    # Check if action history exists in the log
+#    if "action_history" in self.log_csv_dict:
+#        # Retrieve the action history from the log
+#        action_history = self.log_csv_dict["action_history"]
+#        # Format it as a string, joining the list items
+#        return f"Action history: {', '.join(action_history)}."
+#    else:
+#        return "No action history found."
 
 
 parser = argparse.ArgumentParser(description='Run Overcooked benchmark with a specific model.')
@@ -133,14 +107,20 @@ print(f'Scripted partner: {scripted_collab}')
 if __name__ == '__main__':
     LAYOUTS = ['cramped_room', 'forced_coordination', 'counter_circuit_o_1order', 'asymmetric_advantages', 'coordination_ring']
     NUM_TRIALS = 3
+
+    if reflexion == "true":
+        reflections = 'Reflections on previously played games with this partner include:\n'
+    else:
+        reflections = ''
     
     for layout_name in LAYOUTS:
         scores = []
         gpt_3_costs = []
         gpt_4_costs = []
         for idx in range(NUM_TRIALS):
-            score = main(layout_name, model_name, scripted_collab, reflexion)
+            score, prev_game_reflection = main(layout_name, model_name, scripted_collab, reflections)
             scores.append(score)
+            reflections += f"Game {idx+1}: {prev_game_reflection}\n"
 
         with open(f'{layout_name}.txt', 'w') as f:
             f.write("MODEL: GPT4-turbo",)
@@ -148,4 +128,6 @@ if __name__ == '__main__':
             f.write(f"STD ERROR: {np.std(np.array(scores)) / np.sqrt(NUM_TRIALS)}\n")
             f.write(f"SAMPLE SCORES: {scores}\n")
 
+        # test with cramped_room only for now, as it includes all possible actions for agents
+        break
     

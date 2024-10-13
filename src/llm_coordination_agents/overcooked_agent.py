@@ -26,8 +26,8 @@ def set_global_seed(seed):
 set_global_seed(42)
 
 # When using openai API
-# openai.api_key = os.environ['API_KEY']
-# openai.organization = os.environ['ORGANIZATION']
+AZURE_OPENAI_API_KEY = os.environ['AZURE_OPENAI_API_KEY']
+AZURE_OPENAI_API_BASE = os.environ['AZURE_OPENAI_API_BASE']
 
 
 class bcolors:
@@ -80,9 +80,26 @@ EnvDescriptions_SingleAgentAblation = {
     'forced_coordination' : 'The environment is split into two partitions, one with each player. In the right partition, Alice has access to cookers (c0, c1),  delivery area (d0) and kitchen counters (k6, k8, k12). In the left partition, Bob has access to onion dispensers (o0, o1), plate dispenser (p0) and kitchen counters (k1, k10). Kitchen counters can be used to temporarily store onions and plates while you do something else. Both players have access to shared counters (s0, s1, s2) which can be used to transfer onions and plates to the other player depending on the situation. Note that the objects on the shared counters can be accessed by both players. ',
 }
 
+ 
 class LLMManager:
-    def __init__(self, model_name, model_type, cache_dir, temperature=0.6, do_sample=True, max_new_tokens=1000, top_p=0.9, frequency_penalty=0.0, presence_penalty=0.0, api_server=True):
-        self.model_name = model_name 
+    def __init__(self, model_name=None, model_type=None, cache_dir=None, api_key=None, azure_endpoint=None, api_version=None, rate_limit=-1,  temperature=0.6, do_sample=True, max_new_tokens=1000, top_p=0.9, frequency_penalty=0.0, presence_penalty=0.0, api_server=True):
+        # TODO:: THIS IS THE LLMEngineAzureOpenAI CODE
+        assert model_name is not None, "model must be provided"
+        self.model_name = model_name
+        assert api_version is not None, "api_version must be provided"
+        self.api_version = api_version
+        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
+        if api_key is None:
+            raise ValueError("An API Key needs to be provided in either the api_key parameter or as an environment variable named AZURE_OPENAI_API_KEY")
+        self.api_key = api_key
+        azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_API_BASE")
+        if azure_endpoint is None:
+            raise ValueError("An Azure API endpoint needs to be provided in either the azure_endpoint parameter or as an environment variable named AZURE_OPENAI_API_BASE")
+        self.azure_endpoint = azure_endpoint
+        self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
+        self.llm_client = AzureOpenAI(azure_endpoint=self.azure_endpoint, api_key=self.api_key, api_version=self.api_version)
+        self.cost = 0. 
+
         self.model_type = model_type
         self.temperature = temperature
         self.cache_dir = cache_dir
@@ -97,21 +114,37 @@ class LLMManager:
         self.gpt_4_base_cost = 0.011
         self.gpt3_cost = 0
         self.gpt4_cost = 0
-        if self.model_type == 'openai':
-            self.akey = os.getenv("AZURE_OPENAI_ENDPOINT")
-            self.org = os.getenv("AZURE_OPENAI_API_KEY")
-            # self.client = OpenAI(api_key = self.akey, organization = self.org)
-            self.client = AzureOpenAI(
-                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"), 
-                api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
-                api_version="2023-05-15"
-            )
-        else:
-            self.client = OpenAI(
-                api_key="EMPTY",
-                base_url="http://localhost:8000/v1"
-            )
-        self.inference_fn = self.run_openai_inference                    
+        #if self.model_type == 'openai':
+        #    self.akey = os.getenv("AZURE_OPENAI_ENDPOINT")
+        #    self.org = os.getenv("AZURE_OPENAI_API_KEY")
+        #    # self.client = OpenAI(api_key = self.akey, organization = self.org)
+        #    self.client = AzureOpenAI(
+        #        azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"), 
+        #        api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
+        #        api_version="2023-05-15"
+        #    )
+        #else:
+        #    self.client = OpenAI(
+        #        api_key="EMPTY",
+        #        base_url="http://localhost:8000/v1"
+        #    )
+        self.inference_fn = self.generate 
+
+    # @backoff.on_exception(backoff.expo, (APIConnectionError, APIError, RateLimitError), max_tries=10)
+    def generate(self, messages, temperature=0., max_new_tokens=None, **kwargs):
+        '''Generate the next message based on previous messages'''
+        api_call_start = time.time()
+        completion = self.llm_client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=max_new_tokens if max_new_tokens else 4096,
+            temperature=temperature,
+            **kwargs,
+        )
+        print(f"{bcolors.FAIL}LLM INFERENCE TIME: {time.time() - api_call_start}{bcolors.ENDC}")
+        total_tokens = completion.usage.total_tokens
+        self.cost +=  0.02 * ((total_tokens+500) / 1000)
+        return completion.choices[0].message.content              
 
     def run_openai_inference(self, messages):
         api_call_start = time.time()
@@ -130,34 +163,7 @@ class LLMManager:
 
 class LMMEngineAzureOpenAI():
     def __init__(self, api_key=None, azure_endpoint=None, model=None, api_version=None, rate_limit=-1, **kwargs):
-        assert model is not None, "model must be provided"
-        self.model = model
-        assert api_version is not None, "api_version must be provided"
-        self.api_version = api_version
-        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-        if api_key is None:
-            raise ValueError("An API Key needs to be provided in either the api_key parameter or as an environment variable named AZURE_OPENAI_API_KEY")
-        self.api_key = api_key
-        azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_API_BASE")
-        if azure_endpoint is None:
-            raise ValueError("An Azure API endpoint needs to be provided in either the azure_endpoint parameter or as an environment variable named AZURE_OPENAI_API_BASE")
-        self.azure_endpoint = azure_endpoint
-        self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
-        self.llm_client = AzureOpenAI(azure_endpoint=self.azure_endpoint, api_key=self.api_key, api_version=self.api_version)
-        self.cost = 0.
-    # @backoff.on_exception(backoff.expo, (APIConnectionError, APIError, RateLimitError), max_tries=10)
-    def generate(self, messages, temperature=0., max_new_tokens=None, **kwargs):
-        '''Generate the next message based on previous messages'''
-        completion = self.llm_client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=max_new_tokens if max_new_tokens else 4096,
-            temperature=temperature,
-            **kwargs,
-        )
-        total_tokens = completion.usage.total_tokens
-        self.cost +=  0.02 * ((total_tokens+500) / 1000)
-        return completion.choices[0].message.content
+        pass
 
 class LLMAgent:
     def __init__(self, player_id, layout_name, model_name):
@@ -175,8 +181,8 @@ class LLMAgent:
         self.enable_kitchen_counters = True   
         self.explicit_help = False 
         self.single_agent_ablation = True  
-        self.log_replay = pd.read_csv(f'~/llm_coordination/src/agentic_evals/game_logs/ai/forced_coordination/forced_coordination_ai_gpt-4-0125_player_{self.player_id}_2024-03-28_16-39-54.csv')
-        self.replay_actions = list(self.log_replay['selected_action'])
+        #self.log_replay = pd.read_csv(f'~/llm_coordination/src/agentic_evals/game_logs/ai/forced_coordination/forced_coordination_ai_gpt-4-0125_player_{self.player_id}_2024-03-28_16-39-54.csv')
+        #self.replay_actions = list(self.log_replay['selected_action'])
         # self.model = 'gpt-4-0125'
         # self.model_name = 'gpt-4-0125'
         # self.model = 'gpt-35-turbo'
@@ -187,15 +193,17 @@ class LLMAgent:
         # self.model = 'mixtral'
 
         self.model_name = model_name
+        self.model = model_name
         #if 'gpt' in self.model_name:
-        #    self.model_type = 'openai'
+        self.model_type = 'openai'
         #    self.model = self.model_name
         #else:
         #    self.model_type = 'mistral'
         #    self.model = 'mixtral'
 
+        self.llm = LLMManager(self.model_name, self.model_type, os.getenv('HF_HOME'), AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_BASE, api_version="2024-02-01")
         #self.llm = LLMManager(model_name=self.model_name, model_type=self.model_type, cache_dir=os.getenv('HF_HOME'))
-        self.llm = LMMEngineAzureOpenAI(AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_BASE, model_name,  api_version="2024-02-01")
+        #self.llm = LMMEngineAzureOpenAI(AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_BASE, model_name,  api_version="2024-02-01")
 
         self.experiment_type = 'ai'
         
@@ -664,7 +672,8 @@ class LLMAgent:
             if self.save_trajectory:
                 np.save(self.trajectory_path,self.action_history)
         else:
-            try: 
+            try:
+                #pdb.set_trace()
                 # cache which contains the selected action as value 
                 state_only_desc = state_description[state_description.find('state:'):]
                 if self.enable_cache and state_only_desc in self.cache:
@@ -763,7 +772,7 @@ class ReflexionAgent(LLMAgent):
         super().__init__(self, player_id, layout_name, model_name)
 
         self.base_prompt = f'''I am {self.player_names[self.player_id]}. I am playing the game Overcooked with my partner {self.player_names[self.other_player_id]}. {EnvDescriptions[self.layout_name]}
-        Overcooked has the following rules: {self.rules}. We have agreed to follow the following high-level conventions: {self.conventions}. We have just finished a match and need you to reflect on how we performed. If there is something I can do to perform better next match, please identify it. Do not say anything else. Got it?'''
+        Overcooked has the following rules: {self.rules}. Conventions we have agreed to follow beforehand include: {self.conventions}. We have just finished a match and need you to reflect on how we performed. If there is something I can do to perform better next match, please identify it. Got it?'''
 
         if self.model_type == 'openai':
             self.message = [
@@ -776,6 +785,7 @@ class ReflexionAgent(LLMAgent):
                         {"role": "user", "content": self.base_prompt},
                         {"role": "assistant", "content": self.assistant_response_initial},
                     ]
+
     def get_reflection(self, message):
         reflection_msg = self.message + [{"role": "user", "content": f"{message}"}]
         response_string = self.llm.inference_fn(reflection_msg)

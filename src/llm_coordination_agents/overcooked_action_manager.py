@@ -7,6 +7,7 @@ import datetime
 from overcooked_ai_py.mdp.actions import Action, Direction, LLMActionSet
 from llm_coordination_agents.overcooked_agent import LLMAgent, ReflexionAgent
 import re
+import os
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -137,9 +138,9 @@ class LLMActionManager(object):
         self.action_set = LLMActionSet[self.layout_name]
         self.message = ''
         if reflector:
-            self.llm_agent = ReflexionAgent(self.player_id, self.layout_name, model_name, reflector)
+            self.llm_agent = ReflexionAgent(self.player_id, self.layout_name, model_name)
         else:
-            self.llm_agent = LLMAgent(self.player_id, self.layout_name, model_name, reflector) 
+            self.llm_agent = LLMAgent(self.player_id, self.layout_name, model_name) 
         self.save_low_level_trajectory = True
         self.prev_directive = 'wait.'
 
