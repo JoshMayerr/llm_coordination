@@ -7,7 +7,7 @@
 # 4. Score the model after running all inference - separate fuzzy scoring algorithm 
 
 import os 
-from openai import OpenAI, AzureOpenAI
+from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch 
 import re 
@@ -56,9 +56,7 @@ class LLMManager:
         self.cost = 0
         if not api_server:
             if self.model_type == 'openai':
-                self.akey = os.environ['API_KEY']
-                self.org = os.environ['ORGANIZATION']
-                self.client = OpenAI(api_key = self.akey, organization = self.org)
+                self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
                 self.inference_fn = self.run_openai_inference
             elif self.model_type == 'mistral':
                 self.device = "cuda" # the device to load the model onto
@@ -73,14 +71,7 @@ class LLMManager:
                 self.inference_fn = self.run_vicuna_inference
         else:
             if self.model_type == 'openai':
-                self.akey = os.getenv("AZURE_OPENAI_ENDPOINT")
-                self.org = os.getenv("AZURE_OPENAI_API_KEY")
-                # self.client = OpenAI(api_key = self.akey, organization = self.org)
-                self.client = AzureOpenAI(
-                    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"), 
-                    api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
-                    api_version="2023-05-15"
-                )
+                self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
                 self.inference_fn = self.run_openai_inference
             else:
                 self.akey = "EMPTY"

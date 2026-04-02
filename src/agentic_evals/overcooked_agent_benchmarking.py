@@ -1,14 +1,17 @@
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
 from llm_coordination_agents.overcooked_action_manager import LLMActionManager
 from overcooked_ai_py.mdp.actions import Action, Direction
-import time 
-import numpy as np 
-from tqdm import tqdm 
-import argparse 
+import time
+import numpy as np
+from tqdm import tqdm
+import argparse
 
-def main(layout_name, model_name):
+def main(layout_name, model_name, observation_mode):
     mdp = OvercookedGridworld.from_layout_name(layout_name)
-    am = [LLMActionManager(mdp, 'player_0', layout_name, model_name), LLMActionManager(mdp, 'player_1', layout_name, model_name)]
+    am = [
+        LLMActionManager(mdp, 'player_0', layout_name, model_name, observation_mode=observation_mode),
+        LLMActionManager(mdp, 'player_1', layout_name, model_name, observation_mode=observation_mode),
+    ]
     state = mdp.get_standard_start_state()
     print(am[0].llm_agent.model)
     # print(action)
@@ -44,15 +47,23 @@ def main(layout_name, model_name):
     return score
     
 
-parser = argparse.ArgumentParser(description='Run Overcooked benchmark with a specific model.')
-parser.add_argument('model_name', type=str, help='The name of the model to benchmark')
-args = parser.parse_args()
-
-model_name = args.model_name
-print(f'Benchmarking model: {model_name}')
-
-
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Run Overcooked benchmark with a specific model.')
+    parser.add_argument('model_name', type=str, help='The name of the model to benchmark')
+    parser.add_argument(
+        '--observation_mode',
+        type=str,
+        default='text',
+        choices=['text', 'text_image'],
+        help='Whether to send text only or text plus an image rendering of the board state'
+    )
+    args = parser.parse_args()
+
+    model_name = args.model_name
+    observation_mode = args.observation_mode
+    print(f'Benchmarking model: {model_name}')
+    print(f'Observation mode: {observation_mode}')
+
     LAYOUTS = ['forced_coordination', 'cramped_room', 'counter_circuit_o_1order', 'asymmetric_advantages', 'coordination_ring']
     NUM_TRIALS = 3
     
@@ -61,7 +72,7 @@ if __name__ == '__main__':
         gpt_3_costs = []
         gpt_4_costs = []
         for idx in range(NUM_TRIALS):
-            score = main(layout_name, model_name)
+            score = main(layout_name, model_name, observation_mode)
             scores.append(score)
 
         with open(f'{layout_name}.txt', 'w') as f:

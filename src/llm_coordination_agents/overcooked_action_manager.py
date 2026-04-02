@@ -71,7 +71,7 @@ storage_counter_locations = {
 
 
 class LLMActionManager(object):
-    def __init__(self, mdp, player_name, layout_name, model_name): 
+    def __init__(self, mdp, player_name, layout_name, model_name, observation_mode='text'):
         self.layout_name = layout_name
         self.mdp = mdp 
         self.time_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -136,7 +136,12 @@ class LLMActionManager(object):
         }
         self.action_set = LLMActionSet[self.layout_name]
         self.message = ''
-        self.llm_agent = LLMAgent(self.player_id, self.layout_name, model_name) 
+        self.llm_agent = LLMAgent(
+            self.player_id,
+            self.layout_name,
+            model_name,
+            observation_mode=observation_mode,
+        )
         self.save_low_level_trajectory = True
         self.prev_directive = 'wait.'
 
@@ -856,4 +861,3 @@ class LLMActionManager(object):
         
         else:
             return Action.STAY  # Invalid move
-

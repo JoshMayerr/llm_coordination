@@ -1,4 +1,5 @@
-from openai import OpenAI, AzureOpenAI
+from openai import OpenAI
+import base64
 import csv
 from tqdm import tqdm 
 import numpy as np  
@@ -10,6 +11,7 @@ import sys
 import pandas as pd 
 import datetime
 import random 
+from io import BytesIO
 
 from overcooked_ai_py.mdp.actions import LLMActionSet
 logging.basicConfig(filename='debug.log', level=logging.DEBUG)
@@ -17,6 +19,7 @@ logging.debug('Initiated Logger...')
 import time 
 import os.path
 from fuzzywuzzy import process
+from PIL import Image, ImageDraw, ImageFont
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -97,14 +100,7 @@ class LLMManager:
         self.gpt3_cost = 0
         self.gpt4_cost = 0
         if self.model_type == 'openai':
-            self.akey = os.getenv("AZURE_OPENAI_ENDPOINT")
-            self.org = os.getenv("AZURE_OPENAI_API_KEY")
-            # self.client = OpenAI(api_key = self.akey, organization = self.org)
-            self.client = AzureOpenAI(
-                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"), 
-                api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
-                api_version="2023-05-15"
-            )
+            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         else:
             self.client = OpenAI(
                 api_key="EMPTY",
@@ -130,7 +126,7 @@ class LLMManager:
 
 
 class LLMAgent:
-    def __init__(self, player_id, layout_name, model_name):
+    def __init__(self, player_id, layout_name, model_name, observation_mode='text'):
         self.player_id = player_id
         self.layout_name = layout_name
         self.player_names = ['Alice', 'Bob']
@@ -145,8 +141,8 @@ class LLMAgent:
         self.enable_kitchen_counters = True   
         self.explicit_help = False 
         self.single_agent_ablation = True  
-        self.log_replay = pd.read_csv(f'~/llm_coordination/src/agentic_evals/game_logs/ai/forced_coordination/forced_coordination_ai_gpt-4-0125_player_{self.player_id}_2024-03-28_16-39-54.csv')
-        self.replay_actions = list(self.log_replay['selected_action'])
+        self.log_replay = None
+        self.replay_actions = []
         # self.model = 'gpt-4-0125'
         # self.model_name = 'gpt-4-0125'
         # self.model = 'gpt-35-turbo'
@@ -157,6 +153,7 @@ class LLMAgent:
         # self.model = 'mixtral'
 
         self.model_name = model_name
+        self.observation_mode = observation_mode
         if 'gpt' in self.model_name:
             self.model_type = 'openai'
             self.model = self.model_name
@@ -269,6 +266,54 @@ class LLMAgent:
         # print(self.all_actions)
         self.log_csv_dict = {}
         self.action_history = []
+
+    def _state_description_to_image_data_url(self, state_description):
+        grid_lines = []
+        for line in state_description.splitlines():
+            if line.startswith('state:'):
+                continue
+            if line.startswith('action history:'):
+                break
+            if line.strip():
+                grid_lines.append(line)
+
+        if not grid_lines:
+            return None
+
+        font = ImageFont.load_default()
+        line_height = 16
+        padding = 12
+        max_line_chars = max(len(line) for line in grid_lines)
+        width = max(320, padding * 2 + max_line_chars * 7)
+        height = padding * 2 + len(grid_lines) * line_height
+
+        image = Image.new("RGB", (width, height), color=(248, 244, 235))
+        draw = ImageDraw.Draw(image)
+
+        for idx, line in enumerate(grid_lines):
+            y = padding + idx * line_height
+            draw.text((padding, y), line, fill=(45, 45, 45), font=font)
+
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{encoded}"
+
+    def _build_user_message(self, state_description):
+        if self.observation_mode != 'text_image':
+            return {"role": "user", "content": state_description}
+
+        image_data_url = self._state_description_to_image_data_url(state_description)
+        if image_data_url is None:
+            return {"role": "user", "content": state_description}
+
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": state_description},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ],
+        }
     
     def _get_available_actions(self, state_for_llm, message):
         # Available Action Constraints
@@ -640,7 +685,7 @@ class LLMAgent:
                     action, message = self.cache[state_only_desc]
                 else:
                     if len(self.available_actions_list) > 1:
-                        messages = self.message + [{"role": "user", "content": state_description}]
+                        messages = self.message + [self._build_user_message(state_description)]
                         response_string = self.llm.inference_fn(messages=messages)
                         print(f'''{bcolors.WARNING}LLM RESPONSE: {response_string}{bcolors.ENDC}''')
                         action = self.find_best_match(response_string)
@@ -726,4 +771,3 @@ class LLMAgent:
         print('SELECTED ACTION: ', selected_action) 
         
         return selected_action, message 
-

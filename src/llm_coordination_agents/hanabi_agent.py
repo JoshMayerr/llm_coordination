@@ -4,7 +4,7 @@ import numpy as np
 import openai 
 import re 
 import os
-from openai import OpenAI, AzureOpenAI
+from openai import OpenAI
 import itertools
 import pandas as pd 
 import datetime 
@@ -51,11 +51,7 @@ class LLMAgent:
 
 
         if self.model_type == 'openai':
-            self.client = AzureOpenAI(
-                azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"), 
-                api_key=os.getenv("AZURE_OPENAI_API_KEY"),  
-                api_version="2023-05-15"
-            )
+            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         else:
             self.client = OpenAI(
                     api_key="EMPTY",
